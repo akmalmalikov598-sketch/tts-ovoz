@@ -5,9 +5,9 @@ import asyncio
 import logging
 import subprocess
 import threading
+import requests
 import edge_tts
 import imageio_ffmpeg
-from gradio_client import Client, handle_file
 from flask import Flask
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -20,23 +20,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# --- LOGGING (httpx ortiqcha loglarini o'chirish) ---
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# --- ENVIRONMENT VARIABLES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or 0)
-DEFAULT_HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+DEFAULT_FISH_KEY = os.getenv("FISH_API_KEY", "").strip()
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN topilmadi! Render Environment Variables ga qo'shing.")
+    raise ValueError("BOT_TOKEN topilmadi!")
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-SAMPLES_DIR = "voice_samples"
-os.makedirs(SAMPLES_DIR, exist_ok=True)
-
-# --- MA'LUMOTLAR BAZASI (JSON) ---
 DB_FILE = "bot_data.json"
 
 def load_db():
@@ -49,7 +42,7 @@ def load_db():
     return {
         "users": {},
         "channels": [],
-        "hf_token": DEFAULT_HF_TOKEN,
+        "fish_key": DEFAULT_FISH_KEY,
         "total_generated": 0
     }
 
@@ -59,19 +52,17 @@ def save_db(data):
 
 db = load_db()
 
-# --- STANDART TABIIY OVOZLAR ---
 VOICES = {
-    "uz_female": {"id": "uz-UZ-MadinaNeural", "name": "🇺🇿 Madina (Ayol)", "gender": "female"},
-    "uz_male": {"id": "uz-UZ-SardorNeural", "name": "🇺🇿 Sardor (Erkak)", "gender": "male"},
-    "ru_female": {"id": "ru-RU-SvetlanaNeural", "name": "🇷🇺 Svetlana (Ayol)", "gender": "female"},
-    "ru_male": {"id": "ru-RU-DmitryNeural", "name": "🇷🇺 Dmitry (Erkak)", "gender": "male"},
-    "en_female": {"id": "en-US-JennyNeural", "name": "🇺🇸 Jenny (Ayol)", "gender": "female"},
-    "en_male": {"id": "en-US-GuyNeural", "name": "🇺🇸 Guy (Erkak)", "gender": "male"},
-    "tr_female": {"id": "tr-TR-EmelNeural", "name": "🇹🇷 Emel (Ayol)", "gender": "female"},
-    "tr_male": {"id": "tr-TR-AhmetNeural", "name": "🇹🇷 Ahmet (Erkak)", "gender": "male"},
+    "uz_female": {"id": "uz-UZ-MadinaNeural", "name": "🇺🇿 Madina (Ayol)"},
+    "uz_male": {"id": "uz-UZ-SardorNeural", "name": "🇺🇿 Sardor (Erkak)"},
+    "ru_female": {"id": "ru-RU-SvetlanaNeural", "name": "🇷🇺 Svetlana (Ayol)"},
+    "ru_male": {"id": "ru-RU-DmitryNeural", "name": "🇷🇺 Dmitry (Erkak)"},
+    "en_female": {"id": "en-US-JennyNeural", "name": "🇺🇸 Jenny (Ayol)"},
+    "en_male": {"id": "en-US-GuyNeural", "name": "🇺🇸 Guy (Erkak)"},
+    "tr_female": {"id": "tr-TR-EmelNeural", "name": "🇹🇷 Emel (Ayol)"},
+    "tr_male": {"id": "tr-TR-AhmetNeural", "name": "🇹🇷 Ahmet (Erkak)"},
 }
 
-# --- BOT VA DISPATCHER ---
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -80,83 +71,8 @@ class BotStates(StatesGroup):
     waiting_voice_name = State()
     admin_add_channel = State()
     admin_broadcast = State()
-    admin_set_hf = State()
+    admin_set_key = State()
 
-# --- HAQIQIY NEYRON OVOZ KLONLASH (SEED-VC ZERO-SHOT VOICE CONVERSION) ---
-def neural_clone_sync(base_tts_mp3: str, user_ref_wav: str, out_wav: str, hf_token: str = ""):
-    """
-    Seed-VC Zero-Shot Voice Conversion:
-    O'zbekcha ravon o'qilgan bazaviy nutqni (base_tts_mp3) foydalanuvchining haqiqiy
-    ovoz namunasi (user_ref_wav) tembriga 100% neyron tarmoq orqali o'tkazadi.
-    """
-    token_arg = hf_token if hf_token else None
-    last_err = None
-
-    # 1-variant: Plachta/Seed-VC (Eng aniq Zero-Shot Voice Conversion)
-    try:
-        client = Client(
-            "Plachta/Seed-VC",
-            hf_token=token_arg,
-            httpx_kwargs={"timeout": 40.0}
-        )
-        result = client.predict(
-            source=handle_file(base_tts_mp3),
-            target=handle_file(user_ref_wav),
-            diffusion_steps=15,
-            length_adjust=1.0,
-            inference_cfg_rate=0.7,
-            f0_condition=False,
-            auto_f0_adjust=True,
-            pitch_shift=0,
-            api_name="/predict"
-        )
-        # Seed-VC (stream_output, full_output) tuple qaytaradi, 2-element to'liq audio
-        res_path = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else (
-            result[0] if isinstance(result, (list, tuple)) else result
-        )
-        if res_path and os.path.exists(res_path):
-            subprocess.run(
-                [FFMPEG_PATH, "-y", "-i", res_path, out_wav],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
-            )
-            return True
-    except Exception as e:
-        last_err = e
-        logging.warning(f"Seed-VC xatolik: {e}")
-
-    # 2-variant: Zaxira Zero-Shot Voice Conversion serveri
-    try:
-        client2 = Client(
-            "mrfakename/Amphion-MaskGCT",
-            hf_token=token_arg,
-            httpx_kwargs={"timeout": 40.0}
-        )
-        result2 = client2.predict(
-            source_audio=handle_file(base_tts_mp3),
-            reference_audio=handle_file(user_ref_wav),
-            api_name="/voice_conversion"
-        )
-        res_path2 = result2[0] if isinstance(result2, (list, tuple)) else result2
-        if res_path2 and os.path.exists(res_path2):
-            subprocess.run(
-                [FFMPEG_PATH, "-y", "-i", res_path2, out_wav],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
-            )
-            return True
-    except Exception as e2:
-        last_err = e2
-        logging.warning(f"Zaxira VC xatolik: {e2}")
-
-    raise RuntimeError(f"Neyron klonlash serveri javob bermadi: {last_err}")
-
-def convert_to_ogg(input_path: str, output_path: str):
-    cmd = [
-        FFMPEG_PATH, "-y", "-i", input_path,
-        "-c:a", "libopus", "-b:a", "64k", "-vbr", "on", output_path
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-# --- YORDAMCHI FUNKSIYALAR ---
 def get_user(user_id: int, full_name: str = "Foydalanuvchi"):
     uid = str(user_id)
     if uid not in db["users"]:
@@ -165,7 +81,7 @@ def get_user(user_id: int, full_name: str = "Foydalanuvchi"):
             "voice": "uz_female",
             "rate": "+0%",
             "pitch": "+0Hz",
-            "cloned_voices": {}
+            "custom_voices": {}
         }
         save_db(db)
     return db["users"][uid]
@@ -183,7 +99,12 @@ async def check_subs(user_id: int) -> list:
             continue
     return not_subbed
 
-# --- KLAVIATURALAR ---
+def convert_to_ogg(input_path: str, output_path: str):
+    subprocess.run(
+        [FFMPEG_PATH, "-y", "-i", input_path, "-c:a", "libopus", "-b:a", "64k", "-vbr", "on", output_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+    )
+
 def main_menu(user_id: int):
     kb = [
         [KeyboardButton(text="🎙 Ovozni tanlash"), KeyboardButton(text="🧬 O'z ovozimni klonlash")],
@@ -205,14 +126,14 @@ def voices_inline(user_data: dict):
     if row:
         buttons.append(row)
 
-    clones = user_data.get("cloned_voices", {})
-    if clones:
+    customs = user_data.get("custom_voices", {})
+    if customs:
         buttons.append([InlineKeyboardButton(text="--- 🧬 Mening klonlangan ovozlarim ---", callback_data="ignore")])
-        for cname in clones.keys():
-            mark = "✅ " if user_data["voice"] == f"clone:{cname}" else ""
+        for cname, cid in customs.items():
+            mark = "✅ " if user_data["voice"] == f"fish:{cid}" else ""
             buttons.append([
-                InlineKeyboardButton(text=f"{mark}🎤 {cname}", callback_data=f"setvoice:clone:{cname}"),
-                InlineKeyboardButton(text="🗑", callback_data=f"delclone:{cname}")
+                InlineKeyboardButton(text=f"{mark}🎤 {cname}", callback_data=f"setvoice:fish:{cid}"),
+                InlineKeyboardButton(text="🗑", callback_data=f"delcustom:{cid}")
             ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -237,15 +158,14 @@ def settings_inline(user_data: dict):
 def admin_inline():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Statistika", callback_data="adm:stats")],
-        [InlineKeyboardButton(text="📢 Xabar tarqatish (Rassilka)", callback_data="adm:broadcast")],
+        [InlineKeyboardButton(text="📢 Xabar tarqatish", callback_data="adm:broadcast")],
         [
             InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="adm:add_ch"),
-            InlineKeyboardButton(text="➖ Kanallarni ko'rish/o'chirish", callback_data="adm:list_ch")
+            InlineKeyboardButton(text="➖ Kanallarni o'chirish", callback_data="adm:list_ch")
         ],
-        [InlineKeyboardButton(text="🔑 Bepul HF Token kiritish (ixtiyoriy)", callback_data="adm:set_hf")]
+        [InlineKeyboardButton(text="🔑 Fish Audio API kalit kiritish", callback_data="adm:set_key")]
     ])
 
-# --- HANDLERLAR ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -254,19 +174,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if not_sub:
         btns = [[InlineKeyboardButton(text=f"📢 Obuna bo'lish ({ch})", url=f"https://t.me/{ch.replace('@', '')}")] for ch in not_sub]
         btns.append([InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_sub")])
-        return await message.answer(
-            "Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=btns)
-        )
+        return await message.answer("Botdan foydalanish uchun kanallarga obuna bo'ling:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
     await message.answer(
         f"👋 Assalomu alaykum, <b>{message.from_user.first_name}</b>!\n\n"
-        "Menga istalgan matnni yuboring — men uni xuddi tirik odamning ovozidek qilib "
-        "<b>ovozli xabar</b> ko'rinishida qaytaraman!\n\n"
-        "🎙 <b>Imkoniyatlar:</b>\n"
-        "• O'zbek, Rus, Ingliz, Turk tillarida tabiiy erkak va ayol ovozlari\n"
-        "• 🧬 <b>Haqiqiy Neyron Ovoz Klonlash (Seed-VC AI)</b> — o'z ovozingizni yuboring va o'zbek tilida o'z ovozingiz bilan gapirtiring!\n"
-        "• ⚙️ Ovoz tezligi va tonini moslash",
+        "Matn yuboring — tabiiy erkak va ayol ovozlarida yoki o'zingizning klonlangan ovozingizda "
+        "<b>ovozli xabar</b> qilib qaytaraman!",
         parse_mode="HTML",
         reply_markup=main_menu(message.from_user.id)
     )
@@ -277,46 +190,43 @@ async def cb_check_sub(call: types.CallbackQuery):
     if not_sub:
         return await call.answer("❌ Hali barcha kanallarga obuna bo'lmadingiz!", show_alert=True)
     await call.message.delete()
-    await call.message.answer("✅ Obuna tasdiqlandi! Endi matn yuborishingiz mumkin.", reply_markup=main_menu(call.from_user.id))
+    await call.message.answer("✅ Obuna tasdiqlandi!", reply_markup=main_menu(call.from_user.id))
 
 @dp.message(F.text == "🎙 Ovozni tanlash")
 async def menu_voices(message: types.Message):
     user = get_user(message.from_user.id, message.from_user.full_name)
-    await message.answer("🗣 Kerakli ovozni tanlang:", reply_markup=voices_inline(user))
+    await message.answer("🗣 Ovozni tanlang:", reply_markup=voices_inline(user))
 
 @dp.callback_query(F.data.startswith("setvoice:"))
 async def cb_set_voice(call: types.CallbackQuery):
     user = get_user(call.from_user.id)
-    chosen = call.data.split("setvoice:", 1)[1]
-    user["voice"] = chosen
+    user["voice"] = call.data.split("setvoice:", 1)[1]
     save_db(db)
     await call.message.edit_reply_markup(reply_markup=voices_inline(user))
-    await call.answer("✅ Ovoz o'zgartirildi!")
+    await call.answer("✅ Ovoz tanlandi!")
 
-@dp.callback_query(F.data.startswith("delclone:"))
-async def cb_del_clone(call: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("delcustom:"))
+async def cb_del_custom(call: types.CallbackQuery):
     user = get_user(call.from_user.id)
-    cname = call.data.split("delclone:", 1)[1]
-    clones = user.get("cloned_voices", {})
-    if cname in clones:
-        wav_p = clones[cname].get("path", "")
-        if wav_p and os.path.exists(wav_p):
-            os.remove(wav_p)
-        del clones[cname]
-    if user["voice"] == f"clone:{cname}":
+    cid = call.data.split("delcustom:", 1)[1]
+    customs = user.get("custom_voices", {})
+    for k in [k for k, v in customs.items() if v == cid]:
+        del customs[k]
+    if user["voice"] == f"fish:{cid}":
         user["voice"] = "uz_female"
     save_db(db)
+    if db.get("fish_key"):
+        try:
+            requests.delete(f"https://api.fish.audio/model/{cid}", headers={"Authorization": f"Bearer {db['fish_key']}"}, timeout=10)
+        except Exception:
+            pass
     await call.message.edit_reply_markup(reply_markup=voices_inline(user))
-    await call.answer("🗑 Klonlangan ovoz o'chirildi")
+    await call.answer("🗑 O'chirildi")
 
 @dp.message(F.text == "⚙️ Tezlik va Ton")
 async def menu_settings(message: types.Message):
     user = get_user(message.from_user.id)
-    await message.answer(
-        "⚙️ <b>Ovoz parametrlarini sozlash:</b>",
-        parse_mode="HTML",
-        reply_markup=settings_inline(user)
-    )
+    await message.answer("⚙️ <b>Tezlik va ton sozlamalari:</b>", parse_mode="HTML", reply_markup=settings_inline(user))
 
 @dp.callback_query(F.data.startswith("rate:"))
 async def cb_rate(call: types.CallbackQuery):
@@ -332,36 +242,38 @@ async def cb_pitch(call: types.CallbackQuery):
     user["pitch"] = call.data.split(":", 1)[1]
     save_db(db)
     await call.message.edit_reply_markup(reply_markup=settings_inline(user))
-    await call.answer("✅ Ovoz toni saqlandi")
+    await call.answer("✅ Ton saqlandi")
 
 @dp.message(F.text == "ℹ️ Mening sozlamalarim")
 async def menu_info(message: types.Message):
     user = get_user(message.from_user.id)
     v = user["voice"]
-    if v.startswith("clone:"):
-        cname = v.split(":", 1)[1]
-        v_name = f"🧬 {cname} (Neyron klon)"
+    if v.startswith("fish:"):
+        cid = v.split(":", 1)[1]
+        cname = next((k for k, val in user.get("custom_voices", {}).items() if val == cid), "Klonlangan ovoz")
+        v_name = f"🧬 {cname}"
     else:
         v_name = VOICES.get(v, VOICES["uz_female"])["name"]
-
     await message.answer(
-        f"👤 <b>Sizning sozlamalaringiz:</b>\n\n"
         f"🎙 Tanlangan ovoz: <b>{v_name}</b>\n"
         f"⏩ Tezlik: <b>{user.get('rate', '+0%')}</b>\n"
-        f"🎵 Ovoz toni: <b>{user.get('pitch', '+0Hz')}</b>\n"
-        f"🧬 Klonlangan ovozlar: <b>{len(user.get('cloned_voices', {}))} ta</b>",
+        f"🎵 Ton: <b>{user.get('pitch', '+0Hz')}</b>",
         parse_mode="HTML"
     )
 
-# --- NEYRON OVOZ KLONLASH ---
+# --- FISH AUDIO RASMIY API ORQALI OVOZ KLONLASH ---
 @dp.message(F.text == "🧬 O'z ovozimni klonlash")
 async def start_clone(message: types.Message, state: FSMContext):
+    if not db.get("fish_key"):
+        return await message.answer(
+            "⚠️ Ovoz klonlash uchun Admin Panelga <b>Fish Audio</b> bepul API kalitini kiriting (<code>fish.audio</code> saytidan olinadi).\n"
+            "Ungacha <b>🎙 Ovozni tanlash</b> orqali bepul ovozlardan foydalanishingiz mumkin.",
+            parse_mode="HTML"
+        )
     await state.set_state(BotStates.waiting_voice_sample)
     await message.answer(
-        "🎤 <b>O'z ovozingizni Neyron AI orqali klonlash:</b>\n\n"
-        "1. Shovqinsiz joyda <b>10–25 soniya</b> davomida aniq gapirib, menga <b>ovozli xabar (voice)</b> yoki <b>audio</b> yuboring.\n"
-        "2. Seed-VC neyron tarmog'i ovozingiz tembrini nusxalab, yozgan matningizni <b>o'zingizning ovozingiz bilan</b> gapirtiradi!\n\n"
-        "❌ Bekor qilish uchun /start bosing.",
+        "🎤 Shovqinsiz joyda <b>10–30 soniya</b> aniq gapirib <b>ovozli xabar (voice)</b> yoki <b>audio</b> yuboring.\n"
+        "Bekor qilish: /start",
         parse_mode="HTML"
     )
 
@@ -370,95 +282,96 @@ async def receive_voice_sample(message: types.Message, state: FSMContext):
     file_id = message.voice.file_id if message.voice else message.audio.file_id
     duration = message.voice.duration if message.voice else (message.audio.duration or 15)
     if duration < 5:
-        return await message.answer("⚠️ Ovoz juda qisqa! Kamida 8–15 soniyalik ovozli xabar yuboring.")
-
+        return await message.answer("⚠️ Kamida 8-10 soniyalik ovoz yuboring.")
     await state.update_data(sample_file_id=file_id)
     await state.set_state(BotStates.waiting_voice_name)
-    await message.answer("✍️ Ajoyib! Endi bu ovozga nom bering (masalan: <i>Akmal</i> yoki <i>Mening ovozim</i>):", parse_mode="HTML")
+    await message.answer("✍️ Ovozga nom yozing (masalan: <i>Akmal</i>):", parse_mode="HTML")
 
 @dp.message(BotStates.waiting_voice_name, F.text)
 async def receive_voice_name(message: types.Message, state: FSMContext):
-    voice_name = "".join(c for c in message.text.strip() if c.isalnum() or c in " _-")[:20] or "Mening_ovozim"
+    voice_name = message.text.strip()[:25]
     data = await state.get_data()
     file_id = data.get("sample_file_id")
     await state.clear()
 
-    wait_msg = await message.answer("⏳ Ovoz namunasi tayyorlanmoqda...")
+    wait_msg = await message.answer("⏳ Ovoz modeli yaratilmoqda...")
     uid = message.from_user.id
-    raw_path = os.path.join(SAMPLES_DIR, f"raw_{uid}_{int(time.time())}.ogg")
-    wav_path = os.path.join(SAMPLES_DIR, f"{uid}_{voice_name}.wav")
+    raw_path = f"sample_{uid}_{int(time.time())}.ogg"
+    mp3_path = f"sample_{uid}_{int(time.time())}.mp3"
 
     try:
         tg_file = await bot.get_file(file_id)
         await bot.download_file(tg_file.file_path, raw_path)
+        subprocess.run([FFMPEG_PATH, "-y", "-i", raw_path, mp3_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-        subprocess.run(
-            [FFMPEG_PATH, "-y", "-i", raw_path, "-af", "highpass=f=80,lowpass=f=8000", "-ar", "22050", "-ac", "1", wav_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
-        )
+        with open(mp3_path, "rb") as f_audio:
+            resp = requests.post(
+                "https://api.fish.audio/model",
+                headers={"Authorization": f"Bearer {db['fish_key']}"},
+                data={
+                    "visibility": "private",
+                    "type": "tts",
+                    "title": f"{uid}_{voice_name}",
+                    "train_mode": "fast"
+                },
+                files={"voices": (mp3_path, f_audio, "audio/mpeg")},
+                timeout=30
+            )
 
-        user = get_user(uid)
-        curr_v = user.get("voice", "uz_male")
-        gender = VOICES.get(curr_v, {}).get("gender", "male")
-
-        user.setdefault("cloned_voices", {})[voice_name] = {
-            "path": wav_path,
-            "gender": gender
-        }
-        user["voice"] = f"clone:{voice_name}"
-        save_db(db)
-
-        await wait_msg.edit_text(
-            f"✅ <b>«{voice_name}» ovozi saqlandi va tanlandi!</b>\n\n"
-            "Endi menga istalgan matn yozib yuboring — Seed-VC neyron tarmog'i matnni <b>o'zingizning ovozingizda</b> o'qib beradi!",
-            parse_mode="HTML"
-        )
+        if resp.status_code in (200, 201):
+            model_id = resp.json().get("_id") or resp.json().get("id")
+            user = get_user(uid)
+            user.setdefault("custom_voices", {})[voice_name] = model_id
+            user["voice"] = f"fish:{model_id}"
+            save_db(db)
+            await wait_msg.edit_text(
+                f"✅ <b>«{voice_name}» ovozi tayyor va tanlandi!</b>\nEndi matn yuboring — o'z ovozingizda o'qiydi.",
+                parse_mode="HTML"
+            )
+        else:
+            await wait_msg.edit_text(f"❌ API xatosi ({resp.status_code}): {resp.text[:200]}")
     except Exception as e:
-        logging.error(f"Clone save error: {e}")
-        await wait_msg.edit_text(f"❌ Ovozni saqlashda xatolik: {e}")
+        await wait_msg.edit_text(f"❌ Xatolik: {e}")
     finally:
-        if os.path.exists(raw_path):
-            os.remove(raw_path)
+        for p in (raw_path, mp3_path):
+            if os.path.exists(p):
+                os.remove(p)
 
 # --- ADMIN PANEL ---
 @dp.message(F.text == "👑 Admin Panel")
 async def admin_panel(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    await message.answer("👑 <b>Admin Boshqaruv Paneli:</b>", parse_mode="HTML", reply_markup=admin_inline())
+    await message.answer("👑 <b>Admin Panel:</b>", parse_mode="HTML", reply_markup=admin_inline())
 
 @dp.callback_query(F.data.startswith("adm:"))
 async def cb_admin(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return
     action = call.data.split(":", 1)[1]
-
     if action == "stats":
-        total_clones = sum(len(u.get("cloned_voices", {})) for u in db["users"].values())
-        hf_st = "✅ Kiritilgan" if db.get("hf_token") else "⚪️ Standart (bepul)"
+        st = "✅ Ulangan" if db.get("fish_key") else "❌ Kiritilmagan"
         await call.message.answer(
-            f"📊 <b>Bot Statistikasi:</b>\n\n"
-            f"👥 Foydalanuvchilar: <b>{len(db['users'])} ta</b>\n"
-            f"🎙 Yaratilgan ovozlar: <b>{db.get('total_generated', 0)} ta</b>\n"
-            f"🧬 Klonlangan ovozlar: <b>{total_clones} ta</b>\n"
-            f"📢 Majburiy kanallar: <b>{len(db['channels'])} ta</b>\n"
-            f"🔑 HF Token: <b>{hf_st}</b>",
+            f"👥 Foydalanuvchilar: <b>{len(db['users'])}</b>\n"
+            f"🎙 Yaratilgan ovozlar: <b>{db.get('total_generated', 0)}</b>\n"
+            f"📢 Kanallar: <b>{len(db['channels'])}</b>\n"
+            f"🔑 Fish Audio API: <b>{st}</b>",
             parse_mode="HTML"
         )
     elif action == "broadcast":
         await state.set_state(BotStates.admin_broadcast)
-        await call.message.answer("📢 Barcha foydalanuvchilarga yuboriladigan xabarni yuboring:")
+        await call.message.answer("📢 Tarqatiladigan xabarni yuboring:")
     elif action == "add_ch":
         await state.set_state(BotStates.admin_add_channel)
-        await call.message.answer("➕ Kanal usernameni yuboring (masalan: <code>@kanal_nomi</code>). Bot kanalda admin bo'lishi shart!", parse_mode="HTML")
+        await call.message.answer("➕ Kanal usernameni yuboring (<code>@kanal</code>):", parse_mode="HTML")
     elif action == "list_ch":
         if not db["channels"]:
-            return await call.answer("Majburiy kanallar yo'q", show_alert=True)
-        btns = [[InlineKeyboardButton(text=f"❌ O'chirish: {ch}", callback_data=f"delch:{ch}")] for ch in db["channels"]]
-        await call.message.answer("📢 Majburiy obuna kanallari:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
-    elif action == "set_hf":
-        await state.set_state(BotStates.admin_set_hf)
-        await call.message.answer("🔑 HuggingFace bepul tokenini yuboring (o'chirish uchun <code>none</code> yozing):", parse_mode="HTML")
+            return await call.answer("Kanallar yo'q", show_alert=True)
+        btns = [[InlineKeyboardButton(text=f"❌ {ch}", callback_data=f"delch:{ch}")] for ch in db["channels"]]
+        await call.message.answer("Kanallar:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    elif action == "set_key":
+        await state.set_state(BotStates.admin_set_key)
+        await call.message.answer("🔑 <b>fish.audio</b> saytidan olingan API kalitni yuboring (o'chirish: <code>none</code>):", parse_mode="HTML")
     await call.answer()
 
 @dp.callback_query(F.data.startswith("delch:"))
@@ -469,7 +382,7 @@ async def cb_del_channel(call: types.CallbackQuery):
     if ch in db["channels"]:
         db["channels"].remove(ch)
         save_db(db)
-    await call.message.edit_text(f"✅ {ch} ro'yxatdan o'chirildi.")
+    await call.message.edit_text(f"✅ {ch} o'chirildi.")
 
 @dp.message(BotStates.admin_add_channel, F.text)
 async def adm_save_channel(message: types.Message, state: FSMContext):
@@ -482,36 +395,34 @@ async def adm_save_channel(message: types.Message, state: FSMContext):
         db["channels"].append(ch)
         save_db(db)
     await state.clear()
-    await message.answer(f"✅ {ch} majburiy obunaga qo'shildi!", reply_markup=main_menu(ADMIN_ID))
+    await message.answer(f"✅ {ch} qo'shildi!", reply_markup=main_menu(ADMIN_ID))
 
-@dp.message(BotStates.admin_set_hf, F.text)
-async def adm_save_hf(message: types.Message, state: FSMContext):
+@dp.message(BotStates.admin_set_key, F.text)
+async def adm_save_key(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     val = message.text.strip()
-    db["hf_token"] = "" if val.lower() == "none" else val
+    db["fish_key"] = "" if val.lower() == "none" else val
     save_db(db)
     await state.clear()
-    await message.answer("✅ HuggingFace token yangilandi!", reply_markup=main_menu(ADMIN_ID))
+    await message.answer("✅ Fish Audio API kaliti saqlandi!", reply_markup=main_menu(ADMIN_ID))
 
 @dp.message(BotStates.admin_broadcast)
 async def adm_do_broadcast(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.clear()
-    users = list(db["users"].keys())
     sent = 0
-    status_msg = await message.answer(f"⏳ Xabar {len(users)} ta foydalanuvchiga yuborilmoqda...")
-    for uid in users:
+    for uid in list(db["users"].keys()):
         try:
             await message.copy_to(chat_id=int(uid))
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
             pass
-    await status_msg.edit_text(f"✅ Xabar <b>{sent}</b> ta foydalanuvchiga muvaffaqiyatli yetkazildi!", parse_mode="HTML")
+    await message.answer(f"✅ <b>{sent}</b> ta foydalanuvchiga yuborildi!", parse_mode="HTML")
 
-# --- ASOSIY MATNNI OVOZGA AYLANTIRISH ---
+# --- MATNNI OVOZGA AYLANTIRISH ---
 @dp.message(F.text)
 async def text_to_voice_handler(message: types.Message):
     if message.text.startswith("/"):
@@ -525,7 +436,7 @@ async def text_to_voice_handler(message: types.Message):
 
     text = message.text.strip()
     if len(text) > 2500:
-        return await message.answer("⚠️ Matn juda uzun! Iltimos, 2500 ta belgidan kamroq matn yuboring.")
+        return await message.answer("⚠️ Matn 2500 belgidan oshmasligi kerak.")
 
     clean_text = text.replace("'", "ʼ").replace("‘", "ʼ").replace("’", "ʼ")
     user = get_user(message.from_user.id, message.from_user.full_name)
@@ -533,44 +444,35 @@ async def text_to_voice_handler(message: types.Message):
     uid = message.from_user.id
     ts = int(time.time() * 1000)
     mp3_file = f"tts_{uid}_{ts}.mp3"
-    cloned_wav = f"cloned_{uid}_{ts}.wav"
     ogg_file = f"tts_{uid}_{ts}.ogg"
 
     await bot.send_chat_action(chat_id=message.chat.id, action="record_voice")
 
     try:
-        if voice_choice.startswith("clone:"):
-            cname = voice_choice.split(":", 1)[1]
-            c_info = user.get("cloned_voices", {}).get(cname)
-            if not c_info or not os.path.exists(c_info.get("path", "")):
-                return await message.answer("⚠️ Ovoz namunasi topilmadi (server qayta yuklangan bo'lishi mumkin). Iltimos, ovozingizni qayta klonlang.")
+        if voice_choice.startswith("fish:"):
+            model_id = voice_choice.split(":", 1)[1]
+            api_key = db.get("fish_key", "")
+            if not api_key:
+                return await message.answer("⚠️ Fish Audio API kaliti kiritilmagan.")
 
-            status_msg = await message.answer("🧬 <i>Seed-VC neyron tarmog'i ovozingizni sintez qilmoqda (15–30 soniya)...</i>", parse_mode="HTML")
-
-            base_voice = "uz-UZ-SardorNeural" if c_info.get("gender") == "male" else "uz-UZ-MadinaNeural"
-            communicate = edge_tts.Communicate(
-                text=clean_text,
-                voice=base_voice,
-                rate=user.get("rate", "+0%"),
-                pitch="+0Hz"
+            resp = requests.post(
+                "https://api.fish.audio/v1/tts",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "text": clean_text,
+                    "reference_id": model_id,
+                    "format": "mp3"
+                },
+                timeout=30
             )
-            await communicate.save(mp3_file)
-
-            loop = asyncio.get_running_loop()
-            await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    neural_clone_sync,
-                    mp3_file,
-                    c_info["path"],
-                    cloned_wav,
-                    db.get("hf_token", "")
-                ),
-                timeout=90.0
-            )
-            await status_msg.delete()
-            convert_to_ogg(cloned_wav, ogg_file)
-            caption_voice = f"🧬 {cname} (Seed-VC AI klon)"
+            if resp.status_code != 200:
+                return await message.answer(f"❌ Xatolik ({resp.status_code}): {resp.text[:150]}")
+            with open(mp3_file, "wb") as f:
+                f.write(resp.content)
+            caption_voice = "🧬 Klonlangan ovoz"
         else:
             v_info = VOICES.get(voice_choice, VOICES["uz_female"])
             communicate = edge_tts.Communicate(
@@ -580,9 +482,9 @@ async def text_to_voice_handler(message: types.Message):
                 pitch=user.get("pitch", "+0Hz")
             )
             await communicate.save(mp3_file)
-            convert_to_ogg(mp3_file, ogg_file)
             caption_voice = v_info["name"]
 
+        convert_to_ogg(mp3_file, ogg_file)
         db["total_generated"] = db.get("total_generated", 0) + 1
         save_db(db)
 
@@ -591,17 +493,11 @@ async def text_to_voice_handler(message: types.Message):
             caption=f"🎙 <b>{caption_voice}</b>",
             parse_mode="HTML"
         )
-    except asyncio.TimeoutError:
-        logging.error("Clone timeout 90s")
-        await message.answer("⏳ GPU serveri hozir juda band (kutish vaqti tugadi). Bir ozdan so'ng qayta urinib ko'ring.")
     except Exception as e:
-        logging.error(f"TTS/Clone Error: {e}")
-        await message.answer(
-            "❌ Ovoz klonlash serveri hozir band yoki xatolik yuz berdi. "
-            "Birozdan so'ng urinib ko'ring yoki standart ovozlardan foydalaning."
-        )
+        logging.error(f"TTS Error: {e}")
+        await message.answer("❌ Xatolik yuz berdi. Qaytadan urinib ko'ring.")
     finally:
-        for fpath in (mp3_file, cloned_wav, ogg_file):
+        for fpath in (mp3_file, ogg_file):
             if os.path.exists(fpath):
                 os.remove(fpath)
 
@@ -609,12 +505,11 @@ async def text_to_voice_handler(message: types.Message):
 async def cb_ignore(call: types.CallbackQuery):
     await call.answer()
 
-# --- RENDER UCHUN FLASK SERVER VA BOT ISHGA TUSHIRISH ---
 app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Neural Voice TTS & Cloning Bot is running!", 200
+    return "Bot is running!", 200
 
 def run_bot():
     loop = asyncio.new_event_loop()
