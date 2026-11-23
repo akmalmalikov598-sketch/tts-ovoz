@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import time
 import asyncio
@@ -11,7 +10,7 @@ import edge_tts
 import imageio_ffmpeg
 from flask import Flask
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
@@ -91,7 +90,7 @@ def get_user(user_id: int, full_name: str = "Foydalanuvchi"):
             "voice": "uz_female",
             "rate": "+0%",
             "pitch": "+0Hz",
-            "custom_voices": {}  # {"Mening ovozim": "elevenlabs_voice_id"}
+            "custom_voices": {}
         }
         save_db(db)
     return db["users"][uid]
@@ -138,7 +137,6 @@ def voices_inline(user_data: dict):
     if row:
         buttons.append(row)
 
-    # Shaxsiy klonlangan ovozlar
     customs = user_data.get("custom_voices", {})
     if customs:
         buttons.append([InlineKeyboardButton(text="--- 🧬 Mening klonlangan ovozlarim ---", callback_data="ignore")])
@@ -183,7 +181,7 @@ def admin_inline():
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-    user = get_user(message.from_user.id, message.from_user.full_name)
+    get_user(message.from_user.id, message.from_user.full_name)
     not_sub = await check_subs(message.from_user.id)
     if not_sub:
         btns = [[InlineKeyboardButton(text=f"📢 Obuna bo'lish ({ch})", url=f"https://t.me/{ch.replace('@', '')}")] for ch in not_sub]
@@ -238,7 +236,6 @@ async def cb_del_custom(call: types.CallbackQuery):
     if user["voice"] == f"custom:{cid}":
         user["voice"] = "uz_female"
     save_db(db)
-    # ElevenLabs dan ham o'chirishga urinish
     if db.get("elevenlabs_key"):
         try:
             requests.delete(f"https://api.elevenlabs.io/v1/voices/{cid}", headers={"xi-api-key": db["elevenlabs_key"]}, timeout=10)
@@ -482,7 +479,6 @@ async def text_to_voice_handler(message: types.Message):
 
     try:
         if voice_choice.startswith("custom:"):
-            # ElevenLabs Klonlangan Ovoz
             custom_id = voice_choice.split(":", 1)[1]
             api_key = db.get("elevenlabs_key", "")
             if not api_key:
@@ -504,7 +500,6 @@ async def text_to_voice_handler(message: types.Message):
                 f.write(resp.content)
             caption_voice = "🧬 Shaxsiy klonlangan ovoz"
         else:
-            # Edge-TTS Tabiiy Ovozlar
             v_info = VOICES.get(voice_choice, VOICES["uz_female"])
             communicate = edge_tts.Communicate(
                 text=text,
@@ -515,7 +510,6 @@ async def text_to_voice_handler(message: types.Message):
             await communicate.save(mp3_file)
             caption_voice = v_info["name"]
 
-        # Telegram Voice (OGG Opus) formatiga o'tkazish
         convert_to_ogg(mp3_file, ogg_file)
 
         db["total_generated"] = db.get("total_generated", 0) + 1
@@ -549,7 +543,7 @@ def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(bot.delete_webhook(drop_pending_updates=True))
-    loop.run_until_complete(dp.start_polling(bot))
+    loop.run_until_complete(dp.start_polling(bot, handle_signals=False))
 
 threading.Thread(target=run_bot, daemon=True).start()
 
