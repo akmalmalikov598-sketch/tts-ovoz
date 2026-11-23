@@ -20,8 +20,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# --- LOGGING ---
+# --- LOGGING (httpx ortiqcha loglarini o'chirish) ---
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # --- ENVIRONMENT VARIABLES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -81,38 +82,71 @@ class BotStates(StatesGroup):
     admin_broadcast = State()
     admin_set_hf = State()
 
-# --- HAQIQIY NEYRON OVOZ KLONLASH FUNKSIYASI (OPENVOICE V2 + EDGE-TTS) ---
+# --- HAQIQIY NEYRON OVOZ KLONLASH (SEED-VC ZERO-SHOT VOICE CONVERSION) ---
 def neural_clone_sync(base_tts_mp3: str, user_ref_wav: str, out_wav: str, hf_token: str = ""):
     """
-    1. Avval Edge-TTS orqali matn o'zbek/rus/ingliz tilida mukammal talaffuzda o'qiladi (base_tts_mp3).
-    2. Keyin OpenVoice V2 neyron tarmog'i (ToneColorConverter) bazaviy ovozning ohangini
-       100% foydalanuvchining haqiqiy ovoz tembriga (user_ref_wav) o'tkazadi!
+    Seed-VC Zero-Shot Voice Conversion:
+    O'zbekcha ravon o'qilgan bazaviy nutqni (base_tts_mp3) foydalanuvchining haqiqiy
+    ovoz namunasi (user_ref_wav) tembriga 100% neyron tarmoq orqali o'tkazadi.
     """
-    spaces = [
-        "myshell-ai/OpenVoiceV2",
-        "myshell-ai/OpenVoice",
-    ]
+    token_arg = hf_token if hf_token else None
     last_err = None
-    for space in spaces:
-        try:
-            client = Client(space, hf_token=hf_token if hf_token else None)
-            # OpenVoice V2 da ovoz tembrini ko'chirish (Tone Color Conversion)
-            result = client.predict(
-                audio_file_pth=handle_file(base_tts_mp3),
-                reference_speaker=handle_file(user_ref_wav),
-                api_name="/predict"
+
+    # 1-variant: Plachta/Seed-VC (Eng aniq Zero-Shot Voice Conversion)
+    try:
+        client = Client(
+            "Plachta/Seed-VC",
+            hf_token=token_arg,
+            httpx_kwargs={"timeout": 40.0}
+        )
+        result = client.predict(
+            source=handle_file(base_tts_mp3),
+            target=handle_file(user_ref_wav),
+            diffusion_steps=15,
+            length_adjust=1.0,
+            inference_cfg_rate=0.7,
+            f0_condition=False,
+            auto_f0_adjust=True,
+            pitch_shift=0,
+            api_name="/predict"
+        )
+        # Seed-VC (stream_output, full_output) tuple qaytaradi, 2-element to'liq audio
+        res_path = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else (
+            result[0] if isinstance(result, (list, tuple)) else result
+        )
+        if res_path and os.path.exists(res_path):
+            subprocess.run(
+                [FFMPEG_PATH, "-y", "-i", res_path, out_wav],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
             )
-            res_path = result[0] if isinstance(result, (list, tuple)) else result
-            if res_path and os.path.exists(res_path):
-                subprocess.run(
-                    [FFMPEG_PATH, "-y", "-i", res_path, out_wav],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
-                )
-                return True
-        except Exception as e:
-            last_err = e
-            logging.warning(f"Space {space} xatolik: {e}")
-            continue
+            return True
+    except Exception as e:
+        last_err = e
+        logging.warning(f"Seed-VC xatolik: {e}")
+
+    # 2-variant: Zaxira Zero-Shot Voice Conversion serveri
+    try:
+        client2 = Client(
+            "mrfakename/Amphion-MaskGCT",
+            hf_token=token_arg,
+            httpx_kwargs={"timeout": 40.0}
+        )
+        result2 = client2.predict(
+            source_audio=handle_file(base_tts_mp3),
+            reference_audio=handle_file(user_ref_wav),
+            api_name="/voice_conversion"
+        )
+        res_path2 = result2[0] if isinstance(result2, (list, tuple)) else result2
+        if res_path2 and os.path.exists(res_path2):
+            subprocess.run(
+                [FFMPEG_PATH, "-y", "-i", res_path2, out_wav],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+            )
+            return True
+    except Exception as e2:
+        last_err = e2
+        logging.warning(f"Zaxira VC xatolik: {e2}")
+
     raise RuntimeError(f"Neyron klonlash serveri javob bermadi: {last_err}")
 
 def convert_to_ogg(input_path: str, output_path: str):
@@ -131,7 +165,7 @@ def get_user(user_id: int, full_name: str = "Foydalanuvchi"):
             "voice": "uz_female",
             "rate": "+0%",
             "pitch": "+0Hz",
-            "cloned_voices": {}  # {"Akmal": {"path": "voice_samples/123_Akmal.wav", "gender": "male"}}
+            "cloned_voices": {}
         }
         save_db(db)
     return db["users"][uid]
@@ -231,7 +265,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "<b>ovozli xabar</b> ko'rinishida qaytaraman!\n\n"
         "🎙 <b>Imkoniyatlar:</b>\n"
         "• O'zbek, Rus, Ingliz, Turk tillarida tabiiy erkak va ayol ovozlari\n"
-        "• 🧬 <b>Haqiqiy Neyron Ovoz Klonlash (OpenVoice AI)</b> — o'z ovozingizni yuboring va o'zbek tilida o'z ovozingiz bilan gapirtiring!\n"
+        "• 🧬 <b>Haqiqiy Neyron Ovoz Klonlash (Seed-VC AI)</b> — o'z ovozingizni yuboring va o'zbek tilida o'z ovozingiz bilan gapirtiring!\n"
         "• ⚙️ Ovoz tezligi va tonini moslash",
         parse_mode="HTML",
         reply_markup=main_menu(message.from_user.id)
@@ -326,7 +360,7 @@ async def start_clone(message: types.Message, state: FSMContext):
     await message.answer(
         "🎤 <b>O'z ovozingizni Neyron AI orqali klonlash:</b>\n\n"
         "1. Shovqinsiz joyda <b>10–25 soniya</b> davomida aniq gapirib, menga <b>ovozli xabar (voice)</b> yoki <b>audio</b> yuboring.\n"
-        "2. Neyron tarmoq ovozingizning haqiqiy tembrini nusxalab oladi va yozgan matningizni <b>o'zingizning ovozingiz bilan</b> gapirtiradi!\n\n"
+        "2. Seed-VC neyron tarmog'i ovozingiz tembrini nusxalab, yozgan matningizni <b>o'zingizning ovozingiz bilan</b> gapirtiradi!\n\n"
         "❌ Bekor qilish uchun /start bosing.",
         parse_mode="HTML"
     )
@@ -358,14 +392,12 @@ async def receive_voice_name(message: types.Message, state: FSMContext):
         tg_file = await bot.get_file(file_id)
         await bot.download_file(tg_file.file_path, raw_path)
 
-        # Shovqinni tozalab 24kHz mono WAV formatga saqlash
         subprocess.run(
-            [FFMPEG_PATH, "-y", "-i", raw_path, "-af", "highpass=f=80,lowpass=f=8000", "-ar", "24000", "-ac", "1", wav_path],
+            [FFMPEG_PATH, "-y", "-i", raw_path, "-af", "highpass=f=80,lowpass=f=8000", "-ar", "22050", "-ac", "1", wav_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
         )
 
         user = get_user(uid)
-        # Bazaviy talaffuz uchun joriy tanlangan ovoz jinsini olish
         curr_v = user.get("voice", "uz_male")
         gender = VOICES.get(curr_v, {}).get("gender", "male")
 
@@ -377,9 +409,8 @@ async def receive_voice_name(message: types.Message, state: FSMContext):
         save_db(db)
 
         await wait_msg.edit_text(
-            f"✅ <b>«{voice_name}» ovozi Neyron AI bazasiga saqlandi va tanlandi!</b>\n\n"
-            "Endi menga istalgan matn yozib yuboring — OpenVoice neyron tarmog'i matnni <b>o'zingizning ovozingizda</b> o'qib beradi!\n"
-            "<i>(Eslatma: Neyron klonlash 10–25 soniya vaqt olishi mumkin)</i>",
+            f"✅ <b>«{voice_name}» ovozi saqlandi va tanlandi!</b>\n\n"
+            "Endi menga istalgan matn yozib yuboring — Seed-VC neyron tarmog'i matnni <b>o'zingizning ovozingizda</b> o'qib beradi!",
             parse_mode="HTML"
         )
     except Exception as e:
@@ -512,11 +543,10 @@ async def text_to_voice_handler(message: types.Message):
             cname = voice_choice.split(":", 1)[1]
             c_info = user.get("cloned_voices", {}).get(cname)
             if not c_info or not os.path.exists(c_info.get("path", "")):
-                return await message.answer("⚠️ Ovoz namunasi topilmadi (server yangilangan bo'lishi mumkin). Iltimos, ovozingizni qayta klonlang.")
+                return await message.answer("⚠️ Ovoz namunasi topilmadi (server qayta yuklangan bo'lishi mumkin). Iltimos, ovozingizni qayta klonlang.")
 
-            status_msg = await message.answer("🧬 <i>Neyron tarmoq ovozingizni sintez qilmoqda (10–20 soniya)...</i>", parse_mode="HTML")
+            status_msg = await message.answer("🧬 <i>Seed-VC neyron tarmog'i ovozingizni sintez qilmoqda (15–30 soniya)...</i>", parse_mode="HTML")
 
-            # 1-bosqich: O'zbekcha toza talaffuzli bazaviy nutq yaratish
             base_voice = "uz-UZ-SardorNeural" if c_info.get("gender") == "male" else "uz-UZ-MadinaNeural"
             communicate = edge_tts.Communicate(
                 text=clean_text,
@@ -526,19 +556,21 @@ async def text_to_voice_handler(message: types.Message):
             )
             await communicate.save(mp3_file)
 
-            # 2-bosqich: OpenVoice V2 neyron tarmog'i orqali 100% foydalanuvchi ovoz tembriga o'tkazish
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                neural_clone_sync,
-                mp3_file,
-                c_info["path"],
-                cloned_wav,
-                db.get("hf_token", "")
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    neural_clone_sync,
+                    mp3_file,
+                    c_info["path"],
+                    cloned_wav,
+                    db.get("hf_token", "")
+                ),
+                timeout=90.0
             )
             await status_msg.delete()
             convert_to_ogg(cloned_wav, ogg_file)
-            caption_voice = f"🧬 {cname} (Neyron AI klon)"
+            caption_voice = f"🧬 {cname} (Seed-VC AI klon)"
         else:
             v_info = VOICES.get(voice_choice, VOICES["uz_female"])
             communicate = edge_tts.Communicate(
@@ -559,6 +591,9 @@ async def text_to_voice_handler(message: types.Message):
             caption=f"🎙 <b>{caption_voice}</b>",
             parse_mode="HTML"
         )
+    except asyncio.TimeoutError:
+        logging.error("Clone timeout 90s")
+        await message.answer("⏳ GPU serveri hozir juda band (kutish vaqti tugadi). Bir ozdan so'ng qayta urinib ko'ring.")
     except Exception as e:
         logging.error(f"TTS/Clone Error: {e}")
         await message.answer(
