@@ -1,15 +1,13 @@
 import os
 import json
 import time
-import wave
 import asyncio
 import logging
 import subprocess
 import threading
-import numpy as np
-from scipy.signal import butter, lfilter
 import edge_tts
 import imageio_ffmpeg
+from gradio_client import Client, handle_file
 from flask import Flask
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -28,11 +26,14 @@ logging.basicConfig(level=logging.INFO)
 # --- ENVIRONMENT VARIABLES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or 0)
+DEFAULT_HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN topilmadi! Render Environment Variables ga qo'shing.")
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+SAMPLES_DIR = "voice_samples"
+os.makedirs(SAMPLES_DIR, exist_ok=True)
 
 # --- MA'LUMOTLAR BAZASI (JSON) ---
 DB_FILE = "bot_data.json"
@@ -47,6 +48,7 @@ def load_db():
     return {
         "users": {},
         "channels": [],
+        "hf_token": DEFAULT_HF_TOKEN,
         "total_generated": 0
     }
 
@@ -77,97 +79,46 @@ class BotStates(StatesGroup):
     waiting_voice_name = State()
     admin_add_channel = State()
     admin_broadcast = State()
+    admin_set_hf = State()
 
-# --- OVOZNI TAHLIL QILISH VA KLONLASH DVIGATELI (100% BEPUL, API-SIZ) ---
-def analyze_voice_profile(wav_path: str) -> dict:
-    """Foydalanuvchi ovozidan asosiy chastota (F0), jins, tembr va energiyani aniqlaydi."""
-    with wave.open(wav_path, "rb") as wf:
-        sr = wf.getframerate()
-        n_frames = wf.getnframes()
-        raw_data = wf.readframes(n_frames)
-        audio = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
-
-    # Jimjitlikni kesib tashlash
-    energy = np.abs(audio)
-    threshold = np.percentile(energy, 40)
-    voiced = audio[energy > max(threshold, 0.01)]
-    if len(voiced) < sr:
-        voiced = audio
-
-    # Bandpass filtr (70 Hz - 350 Hz inson ovozi asosiy chastotasi)
-    nyq = 0.5 * sr
-    b, a = butter(3, [70.0 / nyq, 350.0 / nyq], btype="band")
-    filtered = lfilter(b, a, voiced)
-
-    # Autocorrelation orqali asosiy chastota (Pitch F0) ni hisoblash
-    frame_len = int(sr * 0.04)  # 40 ms
-    pitches = []
-    min_lag = int(sr / 320)
-    max_lag = int(sr / 75)
-
-    for i in range(0, len(filtered) - frame_len, frame_len):
-        frame = filtered[i:i + frame_len]
-        if np.mean(frame ** 2) < 0.0005:
-            continue
-        corr = np.correlate(frame, frame, mode="full")[len(frame) - 1:]
-        if max_lag < len(corr):
-            peak = np.argmax(corr[min_lag:max_lag]) + min_lag
-            if corr[peak] > 0.35 * corr[0]:
-                f0 = sr / peak
-                pitches.append(f0)
-
-    median_f0 = float(np.median(pitches)) if pitches else 145.0
-
-    # Spektral yorqinlik (tembr ingichka yoki yo'g'onligi)
-    fft_vals = np.abs(np.fft.rfft(voiced[:min(len(voiced), sr * 5)]))
-    freqs = np.fft.rfftfreq(min(len(voiced), sr * 5), 1.0 / sr)
-    centroid = float(np.sum(freqs * fft_vals) / (np.sum(fft_vals) + 1e-8))
-
-    # Jins va bazaviy modelni aniqlash
-    if median_f0 >= 165.0:
-        gender = "female"
-        base_f0 = 210.0  # MadinaNeural o'rtacha F0
-    else:
-        gender = "male"
-        base_f0 = 115.0  # SardorNeural o'rtacha F0
-
-    # Pitch farqini Hz ga o'tkazish (-35Hz dan +35Hz gacha)
-    pitch_diff = int(np.clip((median_f0 - base_f0) * 0.65, -35, 35))
-    pitch_str = f"{pitch_diff:+d}Hz"
-
-    # Tembr koeffitsiyenti (formant siljishi uchun 0.92 - 1.08)
-    timbre_ratio = float(np.clip(1.0 + (centroid - 1400.0) / 14000.0, 0.93, 1.07))
-
-    return {
-        "gender": gender,
-        "f0": round(median_f0, 1),
-        "pitch": pitch_str,
-        "timbre_ratio": round(timbre_ratio, 3),
-        "rate": "+0%"
-    }
-
-def process_cloned_audio(input_mp3: str, output_ogg: str, profile: dict):
-    """Yaratilgan ovozga foydalanuvchi tembri va akustik eq filtrlarini qo'llaydi."""
-    ratio = profile.get("timbre_ratio", 1.0)
-    inv_ratio = round(1.0 / ratio, 4)
-    # Formant va tabiiy iliqlik filtri (asetrate + atempo + compressor)
-    af_filter = (
-        f"asetrate=24000*{ratio},aresample=24000,atempo={inv_ratio},"
-        f"equalizer=f=250:width_type=o:width=1.5:g=2,"
-        f"acompressor=threshold=-18dB:ratio=2.5:attack=15:release=150"
-    )
-    cmd = [
-        FFMPEG_PATH, "-y", "-i", input_mp3,
-        "-af", af_filter,
-        "-c:a", "libopus", "-b:a", "48k", "-vbr", "on",
-        output_ogg
+# --- HAQIQIY NEYRON OVOZ KLONLASH FUNKSIYASI (OPENVOICE V2 + EDGE-TTS) ---
+def neural_clone_sync(base_tts_mp3: str, user_ref_wav: str, out_wav: str, hf_token: str = ""):
+    """
+    1. Avval Edge-TTS orqali matn o'zbek/rus/ingliz tilida mukammal talaffuzda o'qiladi (base_tts_mp3).
+    2. Keyin OpenVoice V2 neyron tarmog'i (ToneColorConverter) bazaviy ovozning ohangini
+       100% foydalanuvchining haqiqiy ovoz tembriga (user_ref_wav) o'tkazadi!
+    """
+    spaces = [
+        "myshell-ai/OpenVoiceV2",
+        "myshell-ai/OpenVoice",
     ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    last_err = None
+    for space in spaces:
+        try:
+            client = Client(space, hf_token=hf_token if hf_token else None)
+            # OpenVoice V2 da ovoz tembrini ko'chirish (Tone Color Conversion)
+            result = client.predict(
+                audio_file_pth=handle_file(base_tts_mp3),
+                reference_speaker=handle_file(user_ref_wav),
+                api_name="/predict"
+            )
+            res_path = result[0] if isinstance(result, (list, tuple)) else result
+            if res_path and os.path.exists(res_path):
+                subprocess.run(
+                    [FFMPEG_PATH, "-y", "-i", res_path, out_wav],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+                )
+                return True
+        except Exception as e:
+            last_err = e
+            logging.warning(f"Space {space} xatolik: {e}")
+            continue
+    raise RuntimeError(f"Neyron klonlash serveri javob bermadi: {last_err}")
 
 def convert_to_ogg(input_path: str, output_path: str):
     cmd = [
         FFMPEG_PATH, "-y", "-i", input_path,
-        "-c:a", "libopus", "-b:a", "48k", "-vbr", "on", output_path
+        "-c:a", "libopus", "-b:a", "64k", "-vbr", "on", output_path
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
@@ -180,7 +131,7 @@ def get_user(user_id: int, full_name: str = "Foydalanuvchi"):
             "voice": "uz_female",
             "rate": "+0%",
             "pitch": "+0Hz",
-            "cloned_voices": {}
+            "cloned_voices": {}  # {"Akmal": {"path": "voice_samples/123_Akmal.wav", "gender": "male"}}
         }
         save_db(db)
     return db["users"][uid]
@@ -256,7 +207,8 @@ def admin_inline():
         [
             InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="adm:add_ch"),
             InlineKeyboardButton(text="➖ Kanallarni ko'rish/o'chirish", callback_data="adm:list_ch")
-        ]
+        ],
+        [InlineKeyboardButton(text="🔑 Bepul HF Token kiritish (ixtiyoriy)", callback_data="adm:set_hf")]
     ])
 
 # --- HANDLERLAR ---
@@ -277,9 +229,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
         f"👋 Assalomu alaykum, <b>{message.from_user.first_name}</b>!\n\n"
         "Menga istalgan matnni yuboring — men uni xuddi tirik odamning ovozidek qilib "
         "<b>ovozli xabar</b> ko'rinishida qaytaraman!\n\n"
-        "🎙 <b>Imkoniyatlar (100% Bepul):</b>\n"
+        "🎙 <b>Imkoniyatlar:</b>\n"
         "• O'zbek, Rus, Ingliz, Turk tillarida tabiiy erkak va ayol ovozlari\n"
-        "• 🧬 <b>O'z ovozingizni klonlash</b> (ovoz yuboring — bot ovozingiz tembri va ohangini nusxalab, o'z ovozingizga o'xshatib gapiradi)\n"
+        "• 🧬 <b>Haqiqiy Neyron Ovoz Klonlash (OpenVoice AI)</b> — o'z ovozingizni yuboring va o'zbek tilida o'z ovozingiz bilan gapirtiring!\n"
         "• ⚙️ Ovoz tezligi va tonini moslash",
         parse_mode="HTML",
         reply_markup=main_menu(message.from_user.id)
@@ -313,6 +265,9 @@ async def cb_del_clone(call: types.CallbackQuery):
     cname = call.data.split("delclone:", 1)[1]
     clones = user.get("cloned_voices", {})
     if cname in clones:
+        wav_p = clones[cname].get("path", "")
+        if wav_p and os.path.exists(wav_p):
+            os.remove(wav_p)
         del clones[cname]
     if user["voice"] == f"clone:{cname}":
         user["voice"] = "uz_female"
@@ -351,7 +306,7 @@ async def menu_info(message: types.Message):
     v = user["voice"]
     if v.startswith("clone:"):
         cname = v.split(":", 1)[1]
-        v_name = f"🧬 {cname} (Shaxsiy klon)"
+        v_name = f"🧬 {cname} (Neyron klon)"
     else:
         v_name = VOICES.get(v, VOICES["uz_female"])["name"]
 
@@ -364,14 +319,14 @@ async def menu_info(message: types.Message):
         parse_mode="HTML"
     )
 
-# --- API-SIZ OVOZ KLONLASH ---
+# --- NEYRON OVOZ KLONLASH ---
 @dp.message(F.text == "🧬 O'z ovozimni klonlash")
 async def start_clone(message: types.Message, state: FSMContext):
     await state.set_state(BotStates.waiting_voice_sample)
     await message.answer(
-        "🎤 <b>O'z ovozingizni klonlash (100% Bepul):</b>\n\n"
-        "Shovqinsiz joyda <b>10–30 soniya</b> davomida tabiiy gapirib, menga <b>ovozli xabar (voice)</b> yoki <b>audio fayl</b> yuboring.\n"
-        "Bot ovozingiz chastotasi (F0), tembri va jinsini tahlil qilib, shaxsiy ovoz profilingizni yaratadi!\n\n"
+        "🎤 <b>O'z ovozingizni Neyron AI orqali klonlash:</b>\n\n"
+        "1. Shovqinsiz joyda <b>10–25 soniya</b> davomida aniq gapirib, menga <b>ovozli xabar (voice)</b> yoki <b>audio</b> yuboring.\n"
+        "2. Neyron tarmoq ovozingizning haqiqiy tembrini nusxalab oladi va yozgan matningizni <b>o'zingizning ovozingiz bilan</b> gapirtiradi!\n\n"
         "❌ Bekor qilish uchun /start bosing.",
         parse_mode="HTML"
     )
@@ -380,8 +335,8 @@ async def start_clone(message: types.Message, state: FSMContext):
 async def receive_voice_sample(message: types.Message, state: FSMContext):
     file_id = message.voice.file_id if message.voice else message.audio.file_id
     duration = message.voice.duration if message.voice else (message.audio.duration or 15)
-    if duration < 4:
-        return await message.answer("⚠️ Ovoz juda qisqa! Kamida 5-10 soniyalik ovozli xabar yuboring.")
+    if duration < 5:
+        return await message.answer("⚠️ Ovoz juda qisqa! Kamida 8–15 soniyalik ovozli xabar yuboring.")
 
     await state.update_data(sample_file_id=file_id)
     await state.set_state(BotStates.waiting_voice_name)
@@ -389,49 +344,50 @@ async def receive_voice_sample(message: types.Message, state: FSMContext):
 
 @dp.message(BotStates.waiting_voice_name, F.text)
 async def receive_voice_name(message: types.Message, state: FSMContext):
-    voice_name = message.text.strip()[:25]
+    voice_name = "".join(c for c in message.text.strip() if c.isalnum() or c in " _-")[:20] or "Mening_ovozim"
     data = await state.get_data()
     file_id = data.get("sample_file_id")
     await state.clear()
 
-    wait_msg = await message.answer("⏳ Ovozingiz tembri va chastotasi tahlil qilinmoqda...")
+    wait_msg = await message.answer("⏳ Ovoz namunasi tayyorlanmoqda...")
     uid = message.from_user.id
-    raw_path = f"sample_{uid}_{int(time.time())}.ogg"
-    wav_path = f"sample_{uid}_{int(time.time())}.wav"
+    raw_path = os.path.join(SAMPLES_DIR, f"raw_{uid}_{int(time.time())}.ogg")
+    wav_path = os.path.join(SAMPLES_DIR, f"{uid}_{voice_name}.wav")
 
     try:
         tg_file = await bot.get_file(file_id)
         await bot.download_file(tg_file.file_path, raw_path)
 
-        # WAV 16kHz mono formatga o'tkazish
+        # Shovqinni tozalab 24kHz mono WAV formatga saqlash
         subprocess.run(
-            [FFMPEG_PATH, "-y", "-i", raw_path, "-ar", "16000", "-ac", "1", wav_path],
+            [FFMPEG_PATH, "-y", "-i", raw_path, "-af", "highpass=f=80,lowpass=f=8000", "-ar", "24000", "-ac", "1", wav_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
         )
 
-        profile = analyze_voice_profile(wav_path)
         user = get_user(uid)
-        user.setdefault("cloned_voices", {})[voice_name] = profile
+        # Bazaviy talaffuz uchun joriy tanlangan ovoz jinsini olish
+        curr_v = user.get("voice", "uz_male")
+        gender = VOICES.get(curr_v, {}).get("gender", "male")
+
+        user.setdefault("cloned_voices", {})[voice_name] = {
+            "path": wav_path,
+            "gender": gender
+        }
         user["voice"] = f"clone:{voice_name}"
         save_db(db)
 
-        gender_uz = "Ayol" if profile["gender"] == "female" else "Erkak"
         await wait_msg.edit_text(
-            f"✅ <b>«{voice_name}» ovozi muvaffaqiyatli klonlandi va tanlandi!</b>\n\n"
-            f"📊 <b>Ovoz tahlili natijasi:</b>\n"
-            f"• Aniqlangan tur: <b>{gender_uz} ovozi</b>\n"
-            f"• Asosiy chastota (F0): <b>{profile['f0']} Hz</b>\n"
-            f"• Ovoz ohangi (Pitch): <b>{profile['pitch']}</b>\n\n"
-            "Endi menga istalgan matn yuboring — o'zingizning ovoz tembringizda o'qib beraman!",
+            f"✅ <b>«{voice_name}» ovozi Neyron AI bazasiga saqlandi va tanlandi!</b>\n\n"
+            "Endi menga istalgan matn yozib yuboring — OpenVoice neyron tarmog'i matnni <b>o'zingizning ovozingizda</b> o'qib beradi!\n"
+            "<i>(Eslatma: Neyron klonlash 10–25 soniya vaqt olishi mumkin)</i>",
             parse_mode="HTML"
         )
     except Exception as e:
-        logging.error(f"Clone error: {e}")
-        await wait_msg.edit_text(f"❌ Ovozni tahlil qilishda xatolik: {e}")
+        logging.error(f"Clone save error: {e}")
+        await wait_msg.edit_text(f"❌ Ovozni saqlashda xatolik: {e}")
     finally:
-        for p in (raw_path, wav_path):
-            if os.path.exists(p):
-                os.remove(p)
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
 
 # --- ADMIN PANEL ---
 @dp.message(F.text == "👑 Admin Panel")
@@ -448,12 +404,14 @@ async def cb_admin(call: types.CallbackQuery, state: FSMContext):
 
     if action == "stats":
         total_clones = sum(len(u.get("cloned_voices", {})) for u in db["users"].values())
+        hf_st = "✅ Kiritilgan" if db.get("hf_token") else "⚪️ Standart (bepul)"
         await call.message.answer(
             f"📊 <b>Bot Statistikasi:</b>\n\n"
             f"👥 Foydalanuvchilar: <b>{len(db['users'])} ta</b>\n"
             f"🎙 Yaratilgan ovozlar: <b>{db.get('total_generated', 0)} ta</b>\n"
             f"🧬 Klonlangan ovozlar: <b>{total_clones} ta</b>\n"
-            f"📢 Majburiy kanallar: <b>{len(db['channels'])} ta</b>",
+            f"📢 Majburiy kanallar: <b>{len(db['channels'])} ta</b>\n"
+            f"🔑 HF Token: <b>{hf_st}</b>",
             parse_mode="HTML"
         )
     elif action == "broadcast":
@@ -467,6 +425,9 @@ async def cb_admin(call: types.CallbackQuery, state: FSMContext):
             return await call.answer("Majburiy kanallar yo'q", show_alert=True)
         btns = [[InlineKeyboardButton(text=f"❌ O'chirish: {ch}", callback_data=f"delch:{ch}")] for ch in db["channels"]]
         await call.message.answer("📢 Majburiy obuna kanallari:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    elif action == "set_hf":
+        await state.set_state(BotStates.admin_set_hf)
+        await call.message.answer("🔑 HuggingFace bepul tokenini yuboring (o'chirish uchun <code>none</code> yozing):", parse_mode="HTML")
     await call.answer()
 
 @dp.callback_query(F.data.startswith("delch:"))
@@ -491,6 +452,16 @@ async def adm_save_channel(message: types.Message, state: FSMContext):
         save_db(db)
     await state.clear()
     await message.answer(f"✅ {ch} majburiy obunaga qo'shildi!", reply_markup=main_menu(ADMIN_ID))
+
+@dp.message(BotStates.admin_set_hf, F.text)
+async def adm_save_hf(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    val = message.text.strip()
+    db["hf_token"] = "" if val.lower() == "none" else val
+    save_db(db)
+    await state.clear()
+    await message.answer("✅ HuggingFace token yangilandi!", reply_markup=main_menu(ADMIN_ID))
 
 @dp.message(BotStates.admin_broadcast)
 async def adm_do_broadcast(message: types.Message, state: FSMContext):
@@ -525,14 +496,13 @@ async def text_to_voice_handler(message: types.Message):
     if len(text) > 2500:
         return await message.answer("⚠️ Matn juda uzun! Iltimos, 2500 ta belgidan kamroq matn yuboring.")
 
-    # O'zbekcha apostroflarni to'g'rilash
     clean_text = text.replace("'", "ʼ").replace("‘", "ʼ").replace("’", "ʼ")
-
     user = get_user(message.from_user.id, message.from_user.full_name)
     voice_choice = user.get("voice", "uz_female")
     uid = message.from_user.id
     ts = int(time.time() * 1000)
     mp3_file = f"tts_{uid}_{ts}.mp3"
+    cloned_wav = f"cloned_{uid}_{ts}.wav"
     ogg_file = f"tts_{uid}_{ts}.ogg"
 
     await bot.send_chat_action(chat_id=message.chat.id, action="record_voice")
@@ -540,21 +510,35 @@ async def text_to_voice_handler(message: types.Message):
     try:
         if voice_choice.startswith("clone:"):
             cname = voice_choice.split(":", 1)[1]
-            profile = user.get("cloned_voices", {}).get(cname)
-            if not profile:
-                return await message.answer("⚠️ Bu klonlangan ovoz topilmadi. Boshqa ovoz tanlang.")
+            c_info = user.get("cloned_voices", {}).get(cname)
+            if not c_info or not os.path.exists(c_info.get("path", "")):
+                return await message.answer("⚠️ Ovoz namunasi topilmadi (server yangilangan bo'lishi mumkin). Iltimos, ovozingizni qayta klonlang.")
 
-            base_voice = "uz-UZ-MadinaNeural" if profile["gender"] == "female" else "uz-UZ-SardorNeural"
-            user_rate = user.get("rate", "+0%")
+            status_msg = await message.answer("🧬 <i>Neyron tarmoq ovozingizni sintez qilmoqda (10–20 soniya)...</i>", parse_mode="HTML")
+
+            # 1-bosqich: O'zbekcha toza talaffuzli bazaviy nutq yaratish
+            base_voice = "uz-UZ-SardorNeural" if c_info.get("gender") == "male" else "uz-UZ-MadinaNeural"
             communicate = edge_tts.Communicate(
                 text=clean_text,
                 voice=base_voice,
-                rate=user_rate,
-                pitch=profile["pitch"]
+                rate=user.get("rate", "+0%"),
+                pitch="+0Hz"
             )
             await communicate.save(mp3_file)
-            process_cloned_audio(mp3_file, ogg_file, profile)
-            caption_voice = f"🧬 {cname} (Klonlangan ovoz)"
+
+            # 2-bosqich: OpenVoice V2 neyron tarmog'i orqali 100% foydalanuvchi ovoz tembriga o'tkazish
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                neural_clone_sync,
+                mp3_file,
+                c_info["path"],
+                cloned_wav,
+                db.get("hf_token", "")
+            )
+            await status_msg.delete()
+            convert_to_ogg(cloned_wav, ogg_file)
+            caption_voice = f"🧬 {cname} (Neyron AI klon)"
         else:
             v_info = VOICES.get(voice_choice, VOICES["uz_female"])
             communicate = edge_tts.Communicate(
@@ -576,10 +560,13 @@ async def text_to_voice_handler(message: types.Message):
             parse_mode="HTML"
         )
     except Exception as e:
-        logging.error(f"TTS Error: {e}")
-        await message.answer("❌ Ovoz yaratishda texnik xatolik yuz berdi. Qaytadan urinib ko'ring.")
+        logging.error(f"TTS/Clone Error: {e}")
+        await message.answer(
+            "❌ Ovoz klonlash serveri hozir band yoki xatolik yuz berdi. "
+            "Birozdan so'ng urinib ko'ring yoki standart ovozlardan foydalaning."
+        )
     finally:
-        for fpath in (mp3_file, ogg_file):
+        for fpath in (mp3_file, cloned_wav, ogg_file):
             if os.path.exists(fpath):
                 os.remove(fpath)
 
@@ -592,7 +579,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Voice TTS & Free Cloning Bot is running!", 200
+    return "Neural Voice TTS & Cloning Bot is running!", 200
 
 def run_bot():
     loop = asyncio.new_event_loop()
