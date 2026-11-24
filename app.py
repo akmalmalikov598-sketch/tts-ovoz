@@ -18,8 +18,13 @@ Render sozlamalari:
     ENABLE_CLONE      - 1 bo'lsa klonlash yoqiladi
     COQUI_TOS_AGREED  - 1 (XTTS litsenziyasi CPML, faqat notijorat; o'qib chiqib o'zingiz qo'ying)
     VOICES_DIR        - klonlangan ovozlar papkasi (default: voices)
+    TELEGRAM_BOT_TOKEN - @BotFather bergan token (Telegram bot yoqiladi)
+    TELEGRAM_ALLOWED_IDS - ixtiyoriy: ruxsat berilgan chat id'lar, vergul bilan (bo'sh = hamma)
+    PUBLIC_URL        - ixtiyoriy: saytingiz manzili (Render'da RENDER_EXTERNAL_URL avtomatik)
 """
+import asyncio
 import glob
+import hashlib
 import io
 import json
 import os
@@ -28,10 +33,12 @@ import shutil
 import tempfile
 import uuid
 import wave
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
+import aiohttp
 import edge_tts
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, Response
 
@@ -41,7 +48,16 @@ ENABLE_CLONE = os.getenv("ENABLE_CLONE", "0") == "1"
 VOICES_DIR = os.getenv("VOICES_DIR", "voices")
 os.makedirs(VOICES_DIR, exist_ok=True)
 
-app = FastAPI(title="Voice Studio")
+@asynccontextmanager
+async def lifespan(_app):
+    try:
+        await tg_setup()
+    except Exception as e:
+        print("Telegram sozlashda xato:", e)
+    yield
+
+
+app = FastAPI(title="Voice Studio", lifespan=lifespan)
 
 
 def auth(x_app_password: Optional[str] = Header(default=None)):
@@ -228,7 +244,162 @@ async def delete_voice(voice_id: str):
     return {"ok": True}
 
 
-@app.get("/", response_class=HTMLResponse)
+# ------------------------------------------------------------------ Telegram bot (webhook)
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_SECRET = hashlib.sha256(("tg" + TG_TOKEN).encode()).hexdigest()[:32]
+TG_ALLOWED = {int(x) for x in os.getenv("TELEGRAM_ALLOWED_IDS", "").replace(" ", "").split(",") if x}
+TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
+MAX_TTS_CHARS = 3000
+
+PRESETS = [
+    ("🇺🇿 Madina (ayol)", "uz-UZ-MadinaNeural"), ("🇺🇿 Sardor (erkak)", "uz-UZ-SardorNeural"),
+    ("🇷🇺 Svetlana (ayol)", "ru-RU-SvetlanaNeural"), ("🇷🇺 Dmitry (erkak)", "ru-RU-DmitryNeural"),
+    ("🇬🇧 Jenny (ayol)", "en-US-JennyNeural"), ("🇬🇧 Guy (erkak)", "en-US-GuyNeural"),
+    ("🇹🇷 Emel (ayol)", "tr-TR-EmelNeural"), ("🇹🇷 Ahmet (erkak)", "tr-TR-AhmetNeural"),
+]
+USER_VOICE: dict = {}   # chat_id -> ovoz
+USER_LANG: dict = {}    # chat_id -> whisper tili (None = avtomatik)
+_tasks: set = set()
+
+WELCOME = (
+    "Salom! 🎙️ Men ovoz botman.\n\n"
+    "• Menga <b>matn</b> yozing — ovozga aylantirib beraman.\n"
+    "• Menga <b>ovozli xabar</b> yoki audio yuboring — matnga aylantirib beraman.\n\n"
+    "Buyruqlar:\n"
+    "/voice — ovozni tanlash (ayol/erkak, til)\n"
+    "/lang uz|ru|en|tr|auto — ovozni matnga aylantirishda tilni belgilash\n"
+)
+
+
+async def tg(method: str, **data):
+    async with aiohttp.ClientSession() as s:
+        async with s.post(f"{TG_API}/{method}", json=data) as r:
+            return await r.json()
+
+
+async def tg_send_audio(chat: int, data: bytes, title: str):
+    fd = aiohttp.FormData()
+    fd.add_field("chat_id", str(chat))
+    fd.add_field("title", title)
+    fd.add_field("audio", data, filename="ovoz.mp3", content_type="audio/mpeg")
+    async with aiohttp.ClientSession() as s:
+        async with s.post(f"{TG_API}/sendAudio", data=fd) as r:
+            return await r.json()
+
+
+async def tg_download(file_id: str):
+    info = await tg("getFile", file_id=file_id)
+    path = info["result"]["file_path"]
+    async with aiohttp.ClientSession() as s:
+        async with s.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}") as r:
+            return await r.read(), path
+
+
+async def tg_say(chat: int, text: str):
+    for i in range(0, len(text), 4000):
+        await tg("sendMessage", chat_id=chat, text=text[i:i + 4000])
+
+
+async def tg_handle(u: dict):
+    chat = None
+    try:
+        if "callback_query" in u:
+            cq = u["callback_query"]
+            chat = cq["message"]["chat"]["id"]
+            data = cq.get("data", "")
+            if data.startswith("v:"):
+                USER_VOICE[chat] = data[2:]
+                await tg("answerCallbackQuery", callback_query_id=cq["id"], text="Ovoz tanlandi ✓")
+                await tg_say(chat, f"Ovoz tanlandi: {data[2:].replace('Neural', '')}\nEndi menga matn yuboring.")
+            return
+        m = u.get("message")
+        if not m:
+            return
+        chat = m["chat"]["id"]
+        if TG_ALLOWED and chat not in TG_ALLOWED:
+            await tg_say(chat, "Kechirasiz, bu bot yopiq.")
+            return
+        text = (m.get("text") or "").strip()
+        if text:
+            cmd = text.split()[0].split("@")[0].lower()
+            if cmd in ("/start", "/help"):
+                await tg("sendMessage", chat_id=chat, text=WELCOME, parse_mode="HTML")
+            elif cmd == "/voice":
+                rows = [[{"text": PRESETS[i][0], "callback_data": "v:" + PRESETS[i][1]},
+                         {"text": PRESETS[i + 1][0], "callback_data": "v:" + PRESETS[i + 1][1]}]
+                        for i in range(0, len(PRESETS), 2)]
+                await tg("sendMessage", chat_id=chat, text="Ovozni tanlang:", reply_markup={"inline_keyboard": rows})
+            elif cmd == "/lang":
+                arg = (text.split()[1:] or ["auto"])[0].lower()
+                USER_LANG[chat] = None if arg == "auto" else arg
+                await tg_say(chat, f"Til: {arg}")
+            elif cmd.startswith("/"):
+                await tg_say(chat, "Noma'lum buyruq. /start ni bosing.")
+            else:
+                if len(text) > MAX_TTS_CHARS:
+                    return await tg_say(chat, f"Matn juda uzun (maksimum {MAX_TTS_CHARS} belgi).")
+                await tg("sendChatAction", chat_id=chat, action="record_voice")
+                voice = USER_VOICE.get(chat, "uz-UZ-MadinaNeural")
+                buf = bytearray()
+                async for ch in edge_tts.Communicate(text, voice).stream():
+                    if ch["type"] == "audio":
+                        buf += ch["data"]
+                if not buf:
+                    return await tg_say(chat, "Ovoz yaratilmadi. Matnni tekshirib qayta urinib ko'ring.")
+                await tg_send_audio(chat, bytes(buf), text[:40])
+            return
+        media = m.get("voice") or m.get("audio") or m.get("video_note") or m.get("document")
+        if media:
+            await tg("sendChatAction", chat_id=chat, action="typing")
+            data, path = await tg_download(media["file_id"])
+            fd, tmp = tempfile.mkstemp(suffix=os.path.splitext(path)[1] or ".oga")
+            os.close(fd)
+            try:
+                open(tmp, "wb").write(data)
+                out, lang = await run_in_threadpool(transcribe, tmp, USER_LANG.get(chat))
+            finally:
+                os.remove(tmp)
+            await tg_say(chat, out or "Gap topilmadi.")
+            return
+        await tg_say(chat, "Matn yoki ovozli xabar yuboring. /start")
+    except Exception as e:
+        print("Telegram xato:", e)
+        if chat:
+            await tg_say(chat, f"Xatolik: {e}")
+
+
+@app.post("/tg/{secret}")
+async def tg_webhook(secret: str, request: Request):
+    if not TG_TOKEN or secret != TG_SECRET:
+        raise HTTPException(403)
+    t = asyncio.create_task(tg_handle(await request.json()))
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+    return {"ok": True}
+
+
+async def tg_setup():
+    base = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    if not TG_TOKEN:
+        print("TELEGRAM_BOT_TOKEN yo'q: Telegram bot o'chiq")
+        return
+    if not base:
+        print("PUBLIC_URL topilmadi: webhook o'rnatilmadi")
+        return
+    url = f"{base}/tg/{TG_SECRET}"
+    info = await tg("getWebhookInfo")
+    if info.get("result", {}).get("url") != url:
+        r = await tg("setWebhook", url=url, allowed_updates=["message", "callback_query"],
+                     drop_pending_updates=True)
+        print("setWebhook:", r)
+    await tg("setMyCommands", commands=[
+        {"command": "start", "description": "Boshlash"},
+        {"command": "voice", "description": "Ovozni tanlash"},
+        {"command": "lang", "description": "Ovoz->matn tili"},
+    ])
+
+
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def index():
     return HTML
 
