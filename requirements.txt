@@ -1,6 +1,7 @@
-aiogram==3.10.0
-edge-tts>=7.0.0
-Flask==3.0.3
-gunicorn==22.0.0
-requests==2.32.3
-imageio-ffmpeg==0.5.1
+fastapi
+uvicorn[standard]
+python-multipart
+edge-tts
+faster-whisper
+# Klonlash kerak bo'lsa, quyidagi qatorning boshidagi # ni olib tashlang (og'ir, 8GB+ RAM):
+# coqui-tts
