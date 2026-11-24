@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 python-multipart
+aiohttp
 edge-tts
 faster-whisper
 # Klonlash kerak bo'lsa, quyidagi qatorning boshidagi # ni olib tashlang (og'ir, 8GB+ RAM):
